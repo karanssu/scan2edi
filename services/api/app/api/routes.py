@@ -1,11 +1,14 @@
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+import httpx
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_db
 from app.models.entities import Invoice, InvoiceLine, Product, Vendor, VendorProductMapping
+from app.core.config import get_settings
 from app.schemas.domain import (
     InvoiceCreate,
     InvoiceLineOut,
@@ -21,6 +24,7 @@ from app.services.export import invoice_to_csv
 from app.services.invoices import build_invoice, refresh_invoice_status
 from app.services.mapping import get_or_create_product
 from app.services.normalization import normalize_description
+from app.services.ocr_client import extract_invoice
 
 router = APIRouter()
 
@@ -135,6 +139,78 @@ def list_mappings(db: Session = Depends(get_db)):
         )
         for m, p in rows
     ]
+
+
+@router.post("/invoices/scan", response_model=InvoiceOut, status_code=201)
+def scan_invoice(
+    file: UploadFile = File(...),
+    vendor_id: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+):
+    allowed = {".png", ".jpg", ".jpeg", ".webp", ".pdf"}
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in allowed:
+        raise HTTPException(415, "Supported invoice files: PNG, JPG, JPEG, WEBP, PDF")
+
+    settings = get_settings()
+    storage = Path(settings.invoice_storage_path)
+    storage.mkdir(parents=True, exist_ok=True)
+
+    import uuid
+    stored_name = f"{uuid.uuid4()}{suffix}"
+    destination = storage / stored_name
+    max_bytes = 25 * 1024 * 1024
+    written = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := file.file.read(1024 * 1024):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(413, "Invoice file exceeds 25 MB")
+                output.write(chunk)
+
+        try:
+            extracted = extract_invoice(destination)
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"Local OCR service failed: {exc}") from exc
+
+        vendor = db.get(Vendor, vendor_id) if vendor_id else None
+        if vendor_id and not vendor:
+            raise HTTPException(404, "Vendor not found")
+        if vendor is None and extracted.vendor_name:
+            vendor = db.scalar(
+                select(Vendor).where(Vendor.name.ilike(extracted.vendor_name.strip()))
+            )
+        if vendor is None:
+            raise HTTPException(409, "Vendor could not be matched. Select the vendor and scan again.")
+
+        payload = InvoiceCreate(
+            vendor_id=vendor.id,
+            invoice_number=extracted.invoice_number,
+            subtotal=extracted.subtotal,
+            invoice_level_discount=extracted.invoice_level_discount,
+            invoice_total=extracted.invoice_total,
+            lines=extracted.lines,
+        )
+        invoice = build_invoice(db, payload)
+        invoice.source_filename = stored_name
+        db.commit()
+        invoice = db.scalar(invoice_query().where(Invoice.id == invoice.id))
+        return serialize_invoice(invoice)
+    except Exception:
+        if not destination.exists():
+            raise
+        # Keep successfully persisted invoices only. Failed scans should not leave
+        # sensitive orphan files behind.
+        if 'invoice' not in locals():
+            destination.unlink(missing_ok=True)
+        raise
+
+
+@router.get("/invoices", response_model=list[InvoiceOut])
+def list_invoices(db: Session = Depends(get_db)):
+    invoices = db.scalars(invoice_query().order_by(Invoice.created_at.desc())).unique().all()
+    return [serialize_invoice(invoice) for invoice in invoices]
 
 
 @router.post("/invoices", response_model=InvoiceOut, status_code=201)

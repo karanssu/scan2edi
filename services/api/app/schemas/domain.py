@@ -85,3 +85,12 @@ class ManualMapRequest(BaseModel):
     upc: str
     canonical_name: str
     units_per_case: int = Field(gt=0)
+
+
+class OCRInvoiceResult(BaseModel):
+    vendor_name: str | None = None
+    invoice_number: str | None = None
+    subtotal: Decimal | None = None
+    invoice_level_discount: Decimal | None = None
+    invoice_total: Decimal | None = None
+    lines: list[InvoiceLineInput]
