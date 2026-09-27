@@ -1,0 +1,216 @@
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+from app.db.session import get_db
+from app.models.entities import Invoice, InvoiceLine, Product, Vendor, VendorProductMapping
+from app.schemas.domain import (
+    InvoiceCreate,
+    InvoiceLineOut,
+    InvoiceOut,
+    ManualMapRequest,
+    MappingCreate,
+    MappingOut,
+    VendorCreate,
+    VendorOut,
+)
+from app.services.calculations import calculate_line
+from app.services.export import invoice_to_csv
+from app.services.invoices import build_invoice, refresh_invoice_status
+from app.services.mapping import get_or_create_product
+from app.services.normalization import normalize_description
+
+router = APIRouter()
+
+
+def invoice_query():
+    return select(Invoice).options(
+        selectinload(Invoice.lines).selectinload(InvoiceLine.product)
+    )
+
+
+def serialize_invoice(invoice: Invoice) -> InvoiceOut:
+    return InvoiceOut(
+        id=invoice.id,
+        vendor_id=invoice.vendor_id,
+        invoice_number=invoice.invoice_number,
+        status=invoice.status,
+        subtotal=invoice.subtotal,
+        invoice_level_discount=invoice.invoice_level_discount,
+        invoice_total=invoice.invoice_total,
+        lines=[
+            InvoiceLineOut(
+                id=line.id,
+                line_number=line.line_number,
+                description=line.description,
+                vendor_sku=line.vendor_sku,
+                upc=line.product.upc if line.product else None,
+                case_quantity=line.case_quantity,
+                units_per_case=line.units_per_case,
+                total_quantity=line.total_quantity,
+                gross_amount=line.gross_amount,
+                product_discount=line.product_discount,
+                export_amount=line.export_amount,
+                needs_review=line.needs_review,
+                review_reason=line.review_reason,
+            )
+            for line in sorted(invoice.lines, key=lambda item: item.line_number)
+        ],
+    )
+
+
+@router.get("/health")
+def health():
+    return {"status": "ok", "service": "scan2edi-api"}
+
+
+@router.post("/vendors", response_model=VendorOut, status_code=201)
+def create_vendor(payload: VendorCreate, db: Session = Depends(get_db)):
+    existing = db.scalar(select(Vendor).where(Vendor.name == payload.name))
+    if existing:
+        return existing
+    vendor = Vendor(name=payload.name)
+    db.add(vendor)
+    db.commit()
+    db.refresh(vendor)
+    return vendor
+
+
+@router.get("/vendors", response_model=list[VendorOut])
+def list_vendors(db: Session = Depends(get_db)):
+    return list(db.scalars(select(Vendor).order_by(Vendor.name)))
+
+
+@router.post("/mappings", response_model=MappingOut, status_code=201)
+def create_mapping(payload: MappingCreate, db: Session = Depends(get_db)):
+    vendor = db.get(Vendor, payload.vendor_id)
+    if not vendor:
+        raise HTTPException(404, "Vendor not found")
+
+    product = get_or_create_product(db, payload.upc, payload.canonical_name)
+    mapping = VendorProductMapping(
+        vendor_id=payload.vendor_id,
+        product_id=product.id,
+        vendor_sku=payload.vendor_sku,
+        vendor_description=payload.vendor_description,
+        normalized_description=normalize_description(payload.vendor_description),
+        units_per_case=payload.units_per_case,
+    )
+    db.add(mapping)
+    db.commit()
+    db.refresh(mapping)
+    return MappingOut(
+        id=mapping.id,
+        vendor_id=mapping.vendor_id,
+        product_id=mapping.product_id,
+        vendor_sku=mapping.vendor_sku,
+        vendor_description=mapping.vendor_description,
+        normalized_description=mapping.normalized_description,
+        units_per_case=mapping.units_per_case,
+        upc=product.upc,
+        canonical_name=product.canonical_name,
+    )
+
+
+@router.get("/mappings", response_model=list[MappingOut])
+def list_mappings(db: Session = Depends(get_db)):
+    rows = db.execute(
+        select(VendorProductMapping, Product)
+        .join(Product, Product.id == VendorProductMapping.product_id)
+        .order_by(VendorProductMapping.vendor_description)
+    ).all()
+    return [
+        MappingOut(
+            id=m.id,
+            vendor_id=m.vendor_id,
+            product_id=m.product_id,
+            vendor_sku=m.vendor_sku,
+            vendor_description=m.vendor_description,
+            normalized_description=m.normalized_description,
+            units_per_case=m.units_per_case,
+            upc=p.upc,
+            canonical_name=p.canonical_name,
+        )
+        for m, p in rows
+    ]
+
+
+@router.post("/invoices", response_model=InvoiceOut, status_code=201)
+def create_invoice(payload: InvoiceCreate, db: Session = Depends(get_db)):
+    if not db.get(Vendor, payload.vendor_id):
+        raise HTTPException(404, "Vendor not found")
+    invoice = build_invoice(db, payload)
+    db.commit()
+    invoice = db.scalar(invoice_query().where(Invoice.id == invoice.id))
+    return serialize_invoice(invoice)
+
+
+@router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
+def get_invoice(invoice_id: str, db: Session = Depends(get_db)):
+    invoice = db.scalar(invoice_query().where(Invoice.id == invoice_id))
+    if not invoice:
+        raise HTTPException(404, "Invoice not found")
+    return serialize_invoice(invoice)
+
+
+@router.post("/invoices/{invoice_id}/lines/{line_id}/map", response_model=InvoiceOut)
+def map_invoice_line(invoice_id: str, line_id: str, payload: ManualMapRequest, db: Session = Depends(get_db)):
+    invoice = db.scalar(invoice_query().where(Invoice.id == invoice_id))
+    if not invoice:
+        raise HTTPException(404, "Invoice not found")
+    line = next((item for item in invoice.lines if item.id == line_id), None)
+    if not line:
+        raise HTTPException(404, "Invoice line not found")
+
+    product = get_or_create_product(db, payload.upc, payload.canonical_name)
+    mapping = VendorProductMapping(
+        vendor_id=invoice.vendor_id,
+        product_id=product.id,
+        vendor_sku=line.vendor_sku,
+        vendor_description=line.description,
+        normalized_description=normalize_description(line.description),
+        units_per_case=payload.units_per_case,
+    )
+    db.add(mapping)
+
+    line.product_id = product.id
+    line.units_per_case = line.units_per_case or payload.units_per_case
+    calc = calculate_line(
+        case_quantity=line.case_quantity,
+        units_per_case=line.units_per_case,
+        explicit_unit_quantity=line.explicit_unit_quantity,
+        case_price=line.case_price,
+        gross_amount=line.gross_amount,
+        product_discount=line.product_discount,
+        explicit_net_amount=line.explicit_net_amount,
+    )
+    line.total_quantity = calc.total_quantity
+    line.gross_amount = calc.gross_amount
+    line.export_amount = calc.export_amount
+    line.needs_review = calc.reason is not None
+    line.review_reason = calc.reason
+    db.flush()
+    refresh_invoice_status(invoice)
+    db.commit()
+
+    invoice = db.scalar(invoice_query().where(Invoice.id == invoice_id))
+    return serialize_invoice(invoice)
+
+
+@router.get("/invoices/{invoice_id}/export.csv")
+def export_invoice(invoice_id: str, db: Session = Depends(get_db)):
+    invoice = db.scalar(invoice_query().where(Invoice.id == invoice_id))
+    if not invoice:
+        raise HTTPException(404, "Invoice not found")
+    try:
+        body = invoice_to_csv(invoice)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    filename = f"scan2edi-{invoice.invoice_number or invoice.id}.csv"
+    return Response(
+        content=body,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
