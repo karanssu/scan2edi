@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-scan2edi}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scan2edi} -d ${POSTGRES_DB:-scan2edi}"]
       interval: 5s
