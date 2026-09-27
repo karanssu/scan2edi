@@ -30,8 +30,8 @@ services:
   ocr:
     build: ./services/ocr
     env_file: .env
-    ports:
-      - "${OCR_PORT:-8080}:8080"
+    expose:
+      - "8080"
     volumes:
       - ./storage/invoices:/data/invoices:ro
     extra_hosts:

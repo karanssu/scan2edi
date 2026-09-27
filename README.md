@@ -61,3 +61,10 @@ PYTHONPATH=. pytest -q
 ```
 
 See `docs/BUSINESS_RULES.md` for the exact financial/export rules.
+
+## Production notes
+
+- Database schema is managed with Alembic migrations.
+- The OCR service is not published to the LAN by the default Compose file.
+- General invoice discounts never alter exported product totals.
+- See `docs/DEPLOYMENT.md` before putting real confidential invoices through the system.
