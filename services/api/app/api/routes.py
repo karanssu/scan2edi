@@ -4,10 +4,11 @@ import httpx
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_db
-from app.models.entities import Invoice, InvoiceLine, Product, Vendor, VendorProductMapping
+from app.models.entities import Invoice, InvoiceLine, MappingHistory, Product, Vendor, VendorProductMapping
 from app.core.config import get_settings
 from app.schemas.domain import (
     InvoiceCreate,
@@ -15,15 +16,16 @@ from app.schemas.domain import (
     InvoiceOut,
     ManualMapRequest,
     MappingCreate,
+    MappingHistoryOut,
     MappingOut,
+    MappingUpdate,
     VendorCreate,
     VendorOut,
 )
 from app.services.calculations import calculate_line
 from app.services.export import invoice_to_csv
 from app.services.invoices import build_invoice, refresh_invoice_status
-from app.services.mapping import get_or_create_product
-from app.services.normalization import normalize_description
+from app.services.mapping import create_or_replace_mapping, deactivate_mapping, update_mapping
 from app.services.ocr_client import extract_invoice
 
 router = APIRouter()
@@ -32,6 +34,29 @@ router = APIRouter()
 def invoice_query():
     return select(Invoice).options(
         selectinload(Invoice.lines).selectinload(InvoiceLine.product)
+    )
+
+
+def mapping_query():
+    return select(VendorProductMapping).options(
+        selectinload(VendorProductMapping.product),
+        selectinload(VendorProductMapping.vendor),
+    )
+
+
+def serialize_mapping(mapping: VendorProductMapping) -> MappingOut:
+    return MappingOut(
+        id=mapping.id,
+        vendor_id=mapping.vendor_id,
+        vendor_name=mapping.vendor.name,
+        product_id=mapping.product_id,
+        vendor_sku=mapping.vendor_sku,
+        vendor_description=mapping.vendor_description,
+        normalized_description=mapping.normalized_description,
+        units_per_case=mapping.units_per_case,
+        upc=mapping.product.upc,
+        canonical_name=mapping.product.canonical_name,
+        active=mapping.active,
     )
 
 
@@ -93,52 +118,82 @@ def create_mapping(payload: MappingCreate, db: Session = Depends(get_db)):
     if not vendor:
         raise HTTPException(404, "Vendor not found")
 
-    product = get_or_create_product(db, payload.upc, payload.canonical_name)
-    mapping = VendorProductMapping(
-        vendor_id=payload.vendor_id,
-        product_id=product.id,
-        vendor_sku=payload.vendor_sku,
-        vendor_description=payload.vendor_description,
-        normalized_description=normalize_description(payload.vendor_description),
-        units_per_case=payload.units_per_case,
-    )
-    db.add(mapping)
-    db.commit()
-    db.refresh(mapping)
-    return MappingOut(
-        id=mapping.id,
-        vendor_id=mapping.vendor_id,
-        product_id=mapping.product_id,
-        vendor_sku=mapping.vendor_sku,
-        vendor_description=mapping.vendor_description,
-        normalized_description=mapping.normalized_description,
-        units_per_case=mapping.units_per_case,
-        upc=product.upc,
-        canonical_name=product.canonical_name,
-    )
+    try:
+        mapping = create_or_replace_mapping(
+            db,
+            vendor_id=payload.vendor_id,
+            vendor_sku=payload.vendor_sku,
+            vendor_description=payload.vendor_description,
+            units_per_case=payload.units_per_case,
+            upc=payload.upc,
+            canonical_name=payload.canonical_name,
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "A conflicting mapping already exists for this vendor/product/pack") from exc
+
+    mapping = db.scalar(mapping_query().where(VendorProductMapping.id == mapping.id))
+    return serialize_mapping(mapping)
 
 
 @router.get("/mappings", response_model=list[MappingOut])
-def list_mappings(db: Session = Depends(get_db)):
-    rows = db.execute(
-        select(VendorProductMapping, Product)
-        .join(Product, Product.id == VendorProductMapping.product_id)
-        .order_by(VendorProductMapping.vendor_description)
-    ).all()
-    return [
-        MappingOut(
-            id=m.id,
-            vendor_id=m.vendor_id,
-            product_id=m.product_id,
-            vendor_sku=m.vendor_sku,
-            vendor_description=m.vendor_description,
-            normalized_description=m.normalized_description,
-            units_per_case=m.units_per_case,
-            upc=p.upc,
-            canonical_name=p.canonical_name,
+def list_mappings(include_inactive: bool = False, db: Session = Depends(get_db)):
+    query = mapping_query().order_by(VendorProductMapping.vendor_description)
+    if not include_inactive:
+        query = query.where(VendorProductMapping.active.is_(True))
+    mappings = db.scalars(query).unique().all()
+    return [serialize_mapping(mapping) for mapping in mappings]
+
+
+@router.patch("/mappings/{mapping_id}", response_model=MappingOut)
+def edit_mapping(mapping_id: str, payload: MappingUpdate, db: Session = Depends(get_db)):
+    mapping = db.scalar(mapping_query().where(VendorProductMapping.id == mapping_id))
+    if not mapping:
+        raise HTTPException(404, "Mapping not found")
+
+    try:
+        update_mapping(
+            db,
+            mapping=mapping,
+            upc=payload.upc,
+            canonical_name=payload.canonical_name,
+            units_per_case=payload.units_per_case,
+            reason=payload.reason,
         )
-        for m, p in rows
-    ]
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "That pack size conflicts with another mapping for this vendor product") from exc
+
+    mapping = db.scalar(mapping_query().where(VendorProductMapping.id == mapping_id))
+    return serialize_mapping(mapping)
+
+
+@router.delete("/mappings/{mapping_id}", status_code=204)
+def delete_mapping(mapping_id: str, reason: str | None = None, db: Session = Depends(get_db)):
+    mapping = db.scalar(mapping_query().where(VendorProductMapping.id == mapping_id))
+    if not mapping:
+        raise HTTPException(404, "Mapping not found")
+    if not mapping.active:
+        return Response(status_code=204)
+
+    deactivate_mapping(db, mapping=mapping, reason=reason)
+    db.commit()
+    return Response(status_code=204)
+
+
+@router.get("/mappings/{mapping_id}/history", response_model=list[MappingHistoryOut])
+def mapping_history(mapping_id: str, db: Session = Depends(get_db)):
+    if not db.get(VendorProductMapping, mapping_id):
+        raise HTTPException(404, "Mapping not found")
+    return list(
+        db.scalars(
+            select(MappingHistory)
+            .where(MappingHistory.mapping_id == mapping_id)
+            .order_by(MappingHistory.created_at.desc())
+        )
+    )
 
 
 @router.post("/invoices/scan", response_model=InvoiceOut, status_code=201)
@@ -200,9 +255,7 @@ def scan_invoice(
     except Exception:
         if not destination.exists():
             raise
-        # Keep successfully persisted invoices only. Failed scans should not leave
-        # sensitive orphan files behind.
-        if 'invoice' not in locals():
+        if "invoice" not in locals():
             destination.unlink(missing_ok=True)
         raise
 
@@ -240,19 +293,25 @@ def map_invoice_line(invoice_id: str, line_id: str, payload: ManualMapRequest, d
     if not line:
         raise HTTPException(404, "Invoice line not found")
 
-    product = get_or_create_product(db, payload.upc, payload.canonical_name)
-    mapping = VendorProductMapping(
-        vendor_id=invoice.vendor_id,
-        product_id=product.id,
-        vendor_sku=line.vendor_sku,
-        vendor_description=line.description,
-        normalized_description=normalize_description(line.description),
-        units_per_case=payload.units_per_case,
-    )
-    db.add(mapping)
+    try:
+        mapping = create_or_replace_mapping(
+            db,
+            vendor_id=invoice.vendor_id,
+            vendor_sku=line.vendor_sku,
+            vendor_description=line.description,
+            units_per_case=payload.units_per_case,
+            upc=payload.upc,
+            canonical_name=payload.canonical_name,
+            reason=payload.reason,
+        )
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "A conflicting product mapping already exists") from exc
 
-    line.product_id = product.id
-    line.units_per_case = line.units_per_case or payload.units_per_case
+    # The invoice line stores its own product_id. Changing the saved mapping later
+    # will not rewrite this historical invoice line.
+    line.product_id = mapping.product_id
+    line.units_per_case = payload.units_per_case
     calc = calculate_line(
         case_quantity=line.case_quantity,
         units_per_case=line.units_per_case,

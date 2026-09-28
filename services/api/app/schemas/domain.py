@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,15 +16,23 @@ class VendorOut(VendorCreate):
 class MappingCreate(BaseModel):
     vendor_id: str
     upc: str = Field(min_length=6, max_length=32)
-    canonical_name: str
-    vendor_description: str
+    canonical_name: str = Field(min_length=1, max_length=250)
+    vendor_description: str = Field(min_length=1, max_length=500)
     vendor_sku: str | None = None
     units_per_case: int = Field(gt=0)
+
+
+class MappingUpdate(BaseModel):
+    upc: str = Field(min_length=6, max_length=32)
+    canonical_name: str = Field(min_length=1, max_length=250)
+    units_per_case: int = Field(gt=0)
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class MappingOut(BaseModel):
     id: str
     vendor_id: str
+    vendor_name: str
     product_id: str
     vendor_sku: str | None
     vendor_description: str
@@ -31,6 +40,21 @@ class MappingOut(BaseModel):
     units_per_case: int
     upc: str
     canonical_name: str
+    active: bool
+
+
+class MappingHistoryOut(BaseModel):
+    id: str
+    mapping_id: str
+    action: str
+    old_upc: str | None
+    new_upc: str | None
+    old_units_per_case: int | None
+    new_units_per_case: int | None
+    reason: str | None
+    changed_by: str
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
 
 
 class InvoiceLineInput(BaseModel):
@@ -82,9 +106,10 @@ class InvoiceOut(BaseModel):
 
 
 class ManualMapRequest(BaseModel):
-    upc: str
-    canonical_name: str
+    upc: str = Field(min_length=6, max_length=32)
+    canonical_name: str = Field(min_length=1, max_length=250)
     units_per_case: int = Field(gt=0)
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class OCRInvoiceResult(BaseModel):
