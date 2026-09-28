@@ -1,6 +1,8 @@
+import logging
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -9,7 +11,10 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from app.extractor import LocalInvoiceExtractor, paddle_document_text
 from app.schemas import ExtractedInvoice
 
-app = FastAPI(title="Scan2EDI Local OCR", version="0.2.0")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("scan2edi.ocr")
+
+app = FastAPI(title="Scan2EDI Local OCR", version="0.3.0")
 
 
 @app.get("/health")
@@ -66,16 +71,26 @@ def extract(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, tmp)
         path = tmp.name
 
+    started = time.monotonic()
+    logger.info("Received invoice %s for local processing", file.filename)
+
     try:
         document_text = paddle_document_text(path)
         if not document_text.strip():
             raise RuntimeError("PaddleOCR returned no document content for this invoice.")
-        return LocalInvoiceExtractor().extract_from_text(document_text)
+
+        result = LocalInvoiceExtractor().extract_from_text(document_text)
+        logger.info(
+            "Invoice %s fully processed locally in %.1fs",
+            file.filename,
+            time.monotonic() - started,
+        )
+        return result
     except RuntimeError as exc:
-        # Missing local dependencies/models and unavailable local inference
-        # services are deployment/readiness failures, not invalid invoices.
+        logger.exception("Local invoice processing failed for %s", file.filename)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
+        logger.exception("Invoice extraction failed for %s", file.filename)
         raise HTTPException(
             status_code=422,
             detail=f"Invoice extraction failed: {type(exc).__name__}: {exc}",

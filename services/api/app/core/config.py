@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     invoice_storage_path: str = "./storage/invoices"
     export_storage_path: str = "./storage/exports"
     ocr_service_url: str = "http://localhost:8080"
+    ocr_request_timeout_seconds: float = 900.0
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

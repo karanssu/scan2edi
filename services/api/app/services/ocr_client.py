@@ -19,7 +19,10 @@ def extract_invoice(path: Path) -> OCRInvoiceResult:
             response = httpx.post(
                 url,
                 files={"file": (path.name, handle, "application/octet-stream")},
-                timeout=240,
+                timeout=httpx.Timeout(
+                    settings.ocr_request_timeout_seconds,
+                    connect=10.0,
+                ),
             )
     except httpx.RequestError as exc:
         raise OCRServiceError(f"Could not reach local OCR service at {url}: {exc}") from exc
