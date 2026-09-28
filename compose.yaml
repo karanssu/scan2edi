@@ -30,12 +30,23 @@ services:
   ocr:
     build: ./services/ocr
     env_file: .env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
     expose:
       - "8080"
     volumes:
       - ./storage/invoices:/data/invoices:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - paddle_models:/root/.paddlex
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    expose:
+      - "11434"
+    volumes:
+      - ollama_data:/root/.ollama
     restart: unless-stopped
 
   web:
@@ -50,3 +61,5 @@ services:
 
 volumes:
   postgres_data:
+  paddle_models:
+  ollama_data:

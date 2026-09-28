@@ -3,12 +3,13 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 
 from app.extractor import LocalInvoiceExtractor, paddle_document_text
 from app.schemas import ExtractedInvoice
 
-app = FastAPI(title="Scan2EDI Local OCR", version="0.1.0")
+app = FastAPI(title="Scan2EDI Local OCR", version="0.2.0")
 
 
 @app.get("/health")
@@ -17,6 +18,44 @@ def health():
         "status": "ok",
         "service": "scan2edi-ocr",
         "engine": os.getenv("OCR_ENGINE", "paddle"),
+    }
+
+
+@app.get("/ready")
+def ready():
+    """Verify that both local inference stages are actually usable."""
+    problems: list[str] = []
+
+    try:
+        import paddleocr  # noqa: F401
+    except Exception as exc:
+        problems.append(f"PaddleOCR is unavailable: {exc}")
+
+    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+    try:
+        response = httpx.get(f"{ollama_url}/api/tags", timeout=5)
+        response.raise_for_status()
+        installed = {
+            item.get("name")
+            for item in response.json().get("models", [])
+            if item.get("name")
+        }
+        if model not in installed:
+            problems.append(
+                f"Ollama model '{model}' is not installed. "
+                f"Run: docker compose exec ollama ollama pull {model}"
+            )
+    except Exception as exc:
+        problems.append(f"Ollama is unavailable at {ollama_url}: {exc}")
+
+    if problems:
+        raise HTTPException(status_code=503, detail=problems)
+
+    return {
+        "status": "ready",
+        "service": "scan2edi-ocr",
+        "model": model,
     }
 
 
@@ -29,8 +68,17 @@ def extract(file: UploadFile = File(...)):
 
     try:
         document_text = paddle_document_text(path)
+        if not document_text.strip():
+            raise RuntimeError("PaddleOCR returned no document content for this invoice.")
         return LocalInvoiceExtractor().extract_from_text(document_text)
+    except RuntimeError as exc:
+        # Missing local dependencies/models and unavailable local inference
+        # services are deployment/readiness failures, not invalid invoices.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invoice extraction failed: {type(exc).__name__}: {exc}",
+        ) from exc
     finally:
         Path(path).unlink(missing_ok=True)

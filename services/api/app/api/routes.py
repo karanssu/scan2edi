@@ -26,7 +26,7 @@ from app.services.calculations import calculate_line
 from app.services.export import invoice_to_csv
 from app.services.invoices import build_invoice, refresh_invoice_status
 from app.services.mapping import create_or_replace_mapping, deactivate_mapping, update_mapping
-from app.services.ocr_client import extract_invoice
+from app.services.ocr_client import OCRServiceError, extract_invoice
 
 router = APIRouter()
 
@@ -226,7 +226,7 @@ def scan_invoice(
 
         try:
             extracted = extract_invoice(destination)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, OCRServiceError) as exc:
             raise HTTPException(502, f"Local OCR service failed: {exc}") from exc
 
         vendor = db.get(Vendor, vendor_id) if vendor_id else None

@@ -1,6 +1,5 @@
 import json
 import os
-from pathlib import Path
 
 import httpx
 
@@ -20,7 +19,7 @@ explicit_unit_quantity is only for invoices that directly state individual unit 
 
 class LocalInvoiceExtractor:
     def __init__(self) -> None:
-        self.ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+        self.ollama_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
         self.model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 
     def extract_from_text(self, document_text: str) -> ExtractedInvoice:
@@ -35,33 +34,55 @@ class LocalInvoiceExtractor:
                 {"role": "user", "content": f"Extract this invoice.\n\n{document_text}"},
             ],
         }
-        response = httpx.post(f"{self.ollama_url}/api/chat", json=payload, timeout=180)
-        response.raise_for_status()
-        content = response.json()["message"]["content"]
-        return ExtractedInvoice.model_validate_json(content)
+
+        try:
+            response = httpx.post(
+                f"{self.ollama_url}/api/chat",
+                json=payload,
+                timeout=180,
+            )
+        except httpx.RequestError as exc:
+            raise RuntimeError(
+                f"Local Ollama service is not reachable at {self.ollama_url}: {exc}"
+            ) from exc
+
+        if response.is_error:
+            try:
+                detail = response.json().get("error") or response.text
+            except Exception:
+                detail = response.text
+            raise RuntimeError(
+                f"Local Ollama returned HTTP {response.status_code}: {detail}"
+            )
+
+        try:
+            content = response.json()["message"]["content"]
+            return ExtractedInvoice.model_validate_json(content)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Local model returned an invalid invoice schema: {exc}"
+            ) from exc
 
 
 def paddle_document_text(path: str) -> str:
-    """Use PaddleOCR-VL locally and return a textual representation.
-
-    PaddleOCR is imported lazily so the lightweight service can start before the
-    hardware-specific PaddlePaddle/PaddleOCR packages are installed.
-    """
+    """Use PaddleOCR-VL locally and return a textual representation."""
     try:
         from paddleocr import PaddleOCRVL
     except ImportError as exc:
         raise RuntimeError(
-            "PaddleOCR-VL is not installed. Install the correct local CPU/GPU "
-            "PaddlePaddle wheel and paddleocr[doc-parser]."
+            "PaddleOCR-VL is not installed in the OCR container. "
+            "Rebuild the OCR image after installing PaddlePaddle and "
+            "paddleocr[doc-parser]."
         ) from exc
 
-    pipeline = PaddleOCRVL()
-    output = list(pipeline.predict(path))
+    try:
+        pipeline = PaddleOCRVL()
+        output = list(pipeline.predict(path))
+    except Exception as exc:
+        raise RuntimeError(f"PaddleOCR-VL failed to process the invoice: {exc}") from exc
+
     parts: list[str] = []
     for page in output:
-        # Current Paddle results can be serialized via their json property in
-        # addition to save_to_json. Falling back to str keeps this adapter
-        # tolerant of minor result API changes.
         data = getattr(page, "json", None)
         if callable(data):
             data = data()
