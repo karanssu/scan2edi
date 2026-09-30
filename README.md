@@ -1,70 +1,101 @@
 # Scan2EDI
 
-Private, on-premise AI invoice processing and EDI/CSV generation.
+Scan2EDI converts invoice images/PDFs into reviewed product lines and exports the fields your downstream system needs:
 
-## Current MVP
+- `UPC Code`
+- `Quantity`
+- `Total Amount`
 
-- Vendors and vendor-specific product mappings
-- UPC mappings saved locally
-- Total-unit quantity calculation (`cases × units per case`)
-- Product-level discount handling
-- General invoice-level discounts stored but ignored in product export
-- Deterministic CSV export: `UPC Code, Quantity, Total Amount`
-- Local OCR service boundary for PaddleOCR-VL
-- Local schema extraction through Ollama structured output
-- PostgreSQL production database / SQLite-friendly application code for tests
-- Next.js review UI
+This repository is a clean rewrite. It uses **Google Cloud Document AI** for document extraction and keeps UPC mapping, quantity math, deposit/discount rules, validation, review, and export inside Scan2EDI.
 
 ## Architecture
 
 ```text
-Browser -> Next.js -> FastAPI -> PostgreSQL
-                        |
-                        +-> Local OCR service -> PaddleOCR-VL -> Local Ollama
+Invoice image / PDF
+        |
+        v
+Google Document AI Custom Extractor
+        |
+        v
+Normalized invoice JSON
+        |
+        v
+Scan2EDI vendor rule engine
+        |
+        +--> UPC / pack mapping database
+        |
+        +--> deterministic quantity + amount calculations
+        |
+        +--> validation / review
+        v
+CSV export (and pluggable future EDI exporter)
 ```
 
-Invoice content is designed to remain on the on-premise network.
+No local PaddleOCR/Ollama service is used in this rewrite.
+
+## Vendor rules included
+
+- Red Bull: `QTY × UNITS`; use printed final `TOTAL`.
+- Polar: case quantity × units/case; use printed final `EXT`/line total.
+- BJ's: product amount + product deposit - product-specific coupon/discount. General receipt discounts are not allocated to products.
+- Market Basket: direct item quantity; use final item/extended amount.
+- Paul Henry Foods: direct quantity; negative quantity/amount is allowed for returns.
+- GL Distribution: use mapped pack size when quantity is case/package quantity.
+- Coca-Cola: prefer explicit final line total; otherwise base amount + product deposit - product-specific discount.
+- Unknown vendors: conservative generic rules and review when quantity/UPC cannot be resolved.
+
+## Important EDI note
+
+The exact target EDI specification has not been supplied, so this repository **does not invent X12 810 or another standard**. It ships a production-ready CSV exporter containing exactly the current required fields and an `InvoiceExporter` interface where the final EDI format can be added once its specification is known. See `docs/ADD_EDI_FORMAT.md`.
 
 ## Quick start
 
-1. Copy environment config:
+1. Copy the environment file:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Change `POSTGRES_PASSWORD` and `DATABASE_URL` in `.env`.
+2. Create a Google Cloud Document AI Custom Extractor and put its project/location/processor IDs in `.env`. See `docs/GOOGLE_DOCUMENT_AI_SETUP.md` and `docs/DOCUMENT_AI_FIELD_GUIDE.md`.
 
-3. Start PostgreSQL/API/web first:
+3. Put the service-account key at:
 
-```bash
-docker compose up --build postgres api web
+```text
+secrets/gcp-service-account.json
 ```
 
-4. Open:
-
-- Web: http://localhost:3000
-- API docs: http://localhost:8000/docs
-- API health: http://localhost:8000/api/health
-
-## OCR setup
-
-PaddleOCR-VL has hardware-specific PaddlePaddle dependencies, so the base OCR image deliberately does not choose CPU vs NVIDIA for you. Follow `docs/OCR_SETUP.md`, then rebuild the OCR container.
-
-Ollama must be available locally and the selected model must already be downloaded before the server is isolated from the internet.
-
-## Tests
+4. Start everything:
 
 ```bash
-cd services/api
-PYTHONPATH=. pytest -q
+docker compose up -d --build
 ```
 
-See `docs/BUSINESS_RULES.md` for the exact financial/export rules.
+5. Verify:
 
-## Production notes
+```bash
+./scripts/check.sh
+```
 
-- Database schema is managed with Alembic migrations.
-- The OCR service is not published to the LAN by the default Compose file.
-- General invoice discounts never alter exported product totals.
-- See `docs/DEPLOYMENT.md` before putting real confidential invoices through the system.
+Or manually:
+
+```bash
+docker compose ps -a
+curl http://localhost:8000/api/health
+```
+
+6. Open:
+
+```text
+http://localhost:3000
+```
+
+## Before replacing your existing GitHub repository
+
+Keep the old repository history on a backup branch first:
+
+```bash
+git checkout -b backup/local-ocr-version
+git push origin backup/local-ocr-version
+```
+
+Then replace the working tree with this project, preserving only `.git/`, and commit the rewrite. Exact commands are in `docs/REPLACE_EXISTING_REPO.md`.

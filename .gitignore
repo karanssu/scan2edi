@@ -1,30 +1,69 @@
+# Environment files
 .env
-.env.local
-.env.*.local
-node_modules/
-.next/
-out/
-*.tsbuildinfo
+.env.*
+!.env.example
+
+# Secrets / credentials
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+gcp-service-account.json
+service-account*.json
+
+# Python
 __pycache__/
 *.py[cod]
-*.egg-info/
-.venv/
-venv/
+*.pyo
+*.pyd
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+build/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local app data
 storage/invoices/*
 storage/exports/*
 !storage/invoices/.gitkeep
 !storage/exports/.gitkeep
+
+# Database / local volumes
+postgres_data/
+*.db
+*.sqlite
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+tmp/
+temp/
+*.tmp
 *.log
-logs/
-*.sql
-*.dump
-/models/
-*.gguf
-*.safetensors
+
+# Docker overrides
+docker-compose.override.yml
+compose.override.yaml

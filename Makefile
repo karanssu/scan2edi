@@ -1,23 +1,24 @@
-.PHONY: setup up down logs test api backup
+SHELL := /bin/bash
 
-setup:
-	@test -f .env || cp .env.example .env
-	@echo "Edit .env, especially POSTGRES_PASSWORD and DATABASE_URL, before production use."
+.PHONY: up down build logs ps test reset-db
 
 up:
-	docker compose up --build -d
+	docker compose up -d --build
+
+build:
+	docker compose build
 
 down:
 	docker compose down
 
 logs:
-	docker compose logs -f --tail=200
+	docker compose logs -f --tail=100
+
+ps:
+	docker compose ps -a
 
 test:
-	cd services/api && PYTHONPATH=. pytest -q
+	docker compose run --rm api pytest -q
 
-api:
-	./infra/scripts/dev-api.sh
-
-backup:
-	./infra/scripts/backup.sh
+reset-db:
+	docker compose down -v

@@ -1,68 +1,54 @@
 services:
   postgres:
-    image: postgres:18
+    image: postgres:16
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-scan2edi}
       POSTGRES_USER: ${POSTGRES_USER:-scan2edi}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     volumes:
-      - postgres_data:/var/lib/postgresql
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scan2edi} -d ${POSTGRES_DB:-scan2edi}"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
     restart: unless-stopped
 
   api:
-    build: ./services/api
+    build:
+      context: ./services/api
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-scan2edi}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-scan2edi}
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
       - ./storage/invoices:/data/invoices
       - ./storage/exports:/data/exports
+      - ./secrets:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
-
-  ocr:
-    build: ./services/ocr
-    env_file: .env
-    environment:
-      OLLAMA_BASE_URL: http://ollama:11434
-      OCR_CPU_THREADS: ${OCR_CPU_THREADS:-4}
-      OMP_NUM_THREADS: ${OCR_CPU_THREADS:-4}
-      MKL_NUM_THREADS: ${OCR_CPU_THREADS:-4}
-    expose:
-      - "8080"
-    volumes:
-      - ./storage/invoices:/data/invoices:ro
-      - paddle_models:/root/.paddlex
-    depends_on:
-      - ollama
-    restart: unless-stopped
-
-  ollama:
-    image: ollama/ollama:latest
-    expose:
-      - "11434"
-    volumes:
-      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
   web:
-    build: ./apps/web
+    build:
+      context: ./apps/web
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:${API_PORT:-8000}
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
     ports:
       - "${WEB_PORT:-3000}:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   postgres_data:
-  paddle_models:
-  ollama_data:
